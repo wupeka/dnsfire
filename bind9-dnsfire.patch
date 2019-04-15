@@ -1,0 +1,1591 @@
+diff --git a/bin/named/server.c b/bin/named/server.c
+index 5653358aba..053acc85d6 100644
+--- a/bin/named/server.c
++++ b/bin/named/server.c
+@@ -63,6 +63,7 @@
+ #include <dns/dlz.h>
+ #include <dns/dnsrps.h>
+ #include <dns/dns64.h>
++#include <dns/dnsfire.h>
+ #include <dns/dyndb.h>
+ #include <dns/events.h>
+ #include <dns/forward.h>
+@@ -5350,9 +5351,7 @@ configure_view(dns_view_t *view, dns_viewlist_t *viewlist,
+ 		const cfg_obj_t *dyndb = cfg_listelt_value(element);
+ 
+ 		if (dctx == NULL) {
+-			const void *hashinit = isc_hash_get_initializer();
+-			CHECK(dns_dyndb_createctx(mctx, hashinit,
+-						  named_g_lctx, view,
++			CHECK(dns_dyndb_createctx(mctx, named_g_lctx, view,
+ 						  named_g_server->zonemgr,
+ 						  named_g_server->task,
+ 						  named_g_timermgr, &dctx));
+@@ -5590,6 +5589,42 @@ configure_view(dns_view_t *view, dns_viewlist_t *viewlist,
+ 	CHECK(configure_dnstap(maps, view));
+ #endif /* HAVE_DNSTAP */
+ 
++	obj = NULL;
++	result = named_config_get(maps, "dnsfire", &obj);
++	if (result == ISC_R_SUCCESS) {
++		const cfg_obj_t *keyobj, *addrobj;
++		const char *key;
++		isc_sockaddr_t sa;
++		char bkey[16];
++		isc_buffer_t b;
++
++		keyobj = cfg_tuple_get(obj, "key");
++		if (keyobj == NULL) {
++			CHECKM(ISC_R_FAILURE, "dnsfire key must be set");
++		}
++		key = cfg_obj_asstring(keyobj);
++		memset(bkey, 0, sizeof(bkey));
++		isc_buffer_init(&b, bkey, sizeof(bkey));
++		result = isc_hex_decodestring(key, &b);
++		if (result != ISC_R_SUCCESS && result != ISC_R_NOSPACE) {
++			goto cleanup;
++		}
++		if (isc_buffer_usedlength(&b) != 16) {
++			CHECKM(ISC_R_RANGE, "dnsfire key must be 16 bytes long");
++		}
++
++		addrobj = cfg_tuple_get(obj, "address");
++		if (addrobj == NULL) {
++			CHECKM(ISC_R_FAILURE, "dnsfire address is required");
++		}
++		sa = *cfg_obj_assockaddr(addrobj);
++		if (isc_sockaddr_getport(&sa) == 0) {
++			CHECKM(ISC_R_FAILURE, "dnsfire port is required");
++		}
++
++		dns_df_init(view->mctx, named_g_socketmgr, named_g_taskmgr, &sa, bkey, &view->dfenv);
++	}
++
+ 	result = ISC_R_SUCCESS;
+ 
+  cleanup:
+diff --git a/bin/tests/system/dyndb/driver/driver.c b/bin/tests/system/dyndb/driver/driver.c
+index 0f6b18d438..bc41b2ec76 100644
+--- a/bin/tests/system/dyndb/driver/driver.c
++++ b/bin/tests/system/dyndb/driver/driver.c
+@@ -80,8 +80,6 @@ dyndb_init(isc_mem_t *mctx, const char *name, const char *parameters,
+ 		dns_log_setcontext(dctx->lctx);
+ 	}
+ 
+-	isc_hash_set_initializer(dctx->hashinit);
+-
+ 	s = isc_mem_strdup(mctx, parameters);
+ 	if (s == NULL) {
+ 		result = ISC_R_NOMEMORY;
+diff --git a/lib/dns/Makefile.in b/lib/dns/Makefile.in
+index dc9d521632..b22d0e70a4 100644
+--- a/lib/dns/Makefile.in
++++ b/lib/dns/Makefile.in
+@@ -58,8 +58,8 @@ DNSTAPOBJS = dnstap.@O@ dnstap.pb-c.@O@
+ DNSOBJS =	acl.@O@ adb.@O@ badcache.@O@ byaddr.@O@ \
+ 		cache.@O@ callbacks.@O@ catz.@O@ clientinfo.@O@ compress.@O@ \
+ 		db.@O@ dbiterator.@O@ dbtable.@O@ diff.@O@ dispatch.@O@ \
+-		dlz.@O@ dns64.@O@ dnsrps.@O@ dnssec.@O@ ds.@O@ dyndb.@O@ \
+-		ecs.@O@ fixedname.@O@ forward.@O@ \
++		dlz.@O@ dns64.@O@ dnsfire.@O@  dnsrps.@O@ dnssec.@O@ ds.@O@ \
++		dyndb.@O@ ecs.@O@ fixedname.@O@ forward.@O@ \
+ 		ipkeylist.@O@ iptable.@O@ journal.@O@ keydata.@O@ \
+ 		keytable.@O@ lib.@O@ log.@O@ lookup.@O@ \
+ 		master.@O@ masterdump.@O@ message.@O@ \
+@@ -95,7 +95,7 @@ DNSTAPSRCS = dnstap.c dnstap.pb-c.c
+ DNSSRCS =	acl.c adb.c badcache. byaddr.c \
+ 		cache.c callbacks.c clientinfo.c compress.c \
+ 		db.c dbiterator.c dbtable.c diff.c dispatch.c \
+-		dlz.c dns64.c dnsrps.c dnssec.c ds.c dyndb.c \
++		dlz.c dns64.c dnsfire.c dnsrps.c dnssec.c ds.c dyndb.c \
+ 		ecs.c fixedname.c forward.c \
+ 		ipkeylist.c iptable.c journal.c keydata.c keytable.c lib.c \
+ 		log.c lookup.c master.c masterdump.c message.c \
+diff --git a/lib/dns/dnsfire.c b/lib/dns/dnsfire.c
+new file mode 100644
+index 0000000000..7371535881
+--- /dev/null
++++ b/lib/dns/dnsfire.c
+@@ -0,0 +1,194 @@
++/*
++ * Copyright (C) Internet Systems Consortium, Inc. ("ISC")
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ *
++ * See the COPYRIGHT file distributed with this work for additional
++ * information regarding copyright ownership.
++ */
++
++/*! \file */
++
++#include <isc/buffer.h>
++#include <isc/magic.h>
++#include <isc/result.h>
++#include <isc/siphash.h>
++#include <isc/socket.h>
++#include <isc/util.h>
++#include <dns/dnsfire.h>
++#include <dns/rdata.h>
++#include <dns/rdataset.h>
++#include <dns/view.h>
++
++
++#define DFENV_MAGIC		ISC_MAGIC('D', 'F', 'E', 'v')
++#define VALID_DFENV(e)		ISC_MAGIC_VALID((e), DFENV_MAGIC)
++
++struct dns_df_env {
++	int magic;
++	isc_mem_t *mctx;
++	isc_socket_t *socket;
++	isc_task_t *task;
++	isc_sockaddr_t dest;
++	uint8_t key[16];
++};
++
++static void
++process_rdataset(dns_rdataset_t *rdataset,
++			 isc_buffer_t *bufA,
++			 isc_buffer_t *bufAAAA,
++			 uint16_t *cntA,
++			 uint16_t *cntAAAA)
++{
++	dns_rdata_t rdata = DNS_RDATA_INIT;
++	isc_result_t result;
++	isc_buffer_t *buf = NULL;
++	uint16_t *cnt = NULL;
++
++	if (rdataset->rdclass != dns_rdataclass_in) {
++		return;
++	}
++	switch (rdataset->type) {
++	case dns_rdatatype_a:
++		buf = bufA;
++		cnt = cntA;
++		break;
++	case dns_rdatatype_aaaa:
++		buf = bufAAAA;
++		cnt = cntAAAA;
++		break;
++	default:
++		return;
++	}
++
++	result = dns_rdataset_first(rdataset);
++	while (result == ISC_R_SUCCESS) {
++		(*cnt)++;
++		dns_rdataset_current(rdataset, &rdata);
++		isc_buffer_putuint32(buf, rdataset->ttl);
++		isc_buffer_putmem(buf, rdata.data, rdata.length);
++		dns_rdata_reset(&rdata);
++		result = dns_rdataset_next(rdataset);
++	}
++}
++
++static void
++send_done(isc_task_t *_task, isc_event_t *event) {
++	REQUIRE(event->ev_type == ISC_SOCKEVENT_SENDDONE);
++	isc_buffer_t *buf = event->ev_arg;
++	isc_buffer_free(&buf);
++	UNUSED(_task);
++	isc_event_free(&event);
++}
++
++isc_result_t
++dns_df_init(isc_mem_t *mctx,
++            isc_socketmgr_t *socketmgr,
++	    isc_taskmgr_t *taskmgr,
++            isc_sockaddr_t *dest,
++            char* key,
++            dns_df_env_t **envp)
++{
++	dns_df_env_t *env = isc_mem_get(mctx, sizeof(dns_df_env_t));
++	env->mctx = NULL;
++	env->socket = NULL;
++	env->task = NULL;
++	memcpy(&env->dest, dest, sizeof(isc_sockaddr_t));
++	memcpy(env->key, key, sizeof(env->key));
++	isc_socket_create(socketmgr, env->dest.type.sa.sa_family,
++			  isc_sockettype_udp, &env->socket);
++	isc_task_create(taskmgr, 30, &env->task);
++	isc_mem_attach(mctx, &env->mctx);
++	env->magic = DFENV_MAGIC;
++	*envp = env;
++	return (ISC_R_SUCCESS);
++}
++
++void
++dns_df_close(dns_df_env_t **envp) {
++	dns_df_env_t *env;
++	INSIST(envp != NULL && VALID_DFENV(*envp));
++	env = *envp;
++	env->magic = 0;
++	isc_socket_detach(&env->socket);
++	isc_task_detach(&env->task);
++	isc_mem_putanddetach(&env->mctx, env, sizeof(dns_df_env_t));
++	*envp = NULL;
++}
++
++void
++dns_df_send(dns_df_env_t *env, dns_message_t *msg) {
++	dns_namelist_t *section;
++	dns_rdataset_t *rdataset;
++	dns_name_t *name;
++	int sect;
++	isc_result_t result;
++	isc_buffer_t *bufA = NULL, *bufAAAA = NULL, *buf = NULL;
++	uint16_t cntA=0, cntAAAA=0;
++	int len;
++	isc_region_t r;
++	isc_socketevent_t *sevent;
++	uint8_t *hmac;
++
++	REQUIRE(VALID_DFENV(env));
++
++	result = isc_buffer_allocate(env->mctx, &bufA, 4096);
++	INSIST(result == ISC_R_SUCCESS);
++	isc_buffer_setautorealloc(bufA, true);
++
++	result = isc_buffer_allocate(env->mctx, &bufAAAA, 4096);
++	INSIST(result == ISC_R_SUCCESS);
++	isc_buffer_setautorealloc(bufAAAA, true);
++
++	for (sect = DNS_SECTION_ANSWER; sect < DNS_SECTION_MAX; sect++) {
++		section = &msg->sections[sect];
++
++		name = ISC_LIST_HEAD(*section);
++		while (name != NULL) {
++			rdataset = ISC_LIST_HEAD(name->list);
++			while (rdataset != NULL) {
++				process_rdataset(rdataset,
++						 bufA,
++						 bufAAAA,
++						 &cntA,
++						 &cntAAAA);
++				rdataset = ISC_LIST_NEXT(rdataset, link);
++			}
++			name = ISC_LIST_NEXT(name, link);
++		}
++	}
++	if (cntA + cntAAAA == 0) {
++		return;
++	}
++
++	len = 4 + 4 + 2 + 2 + 8*cntA + 20*cntAAAA + 8;
++	result = isc_buffer_allocate(env->mctx, &buf, len);
++	INSIST(result == ISC_R_SUCCESS);
++
++	isc_buffer_putmem(buf, "DFE1", 4);
++	isc_buffer_putuint32(buf, 0);
++	isc_buffer_putuint16(buf, cntA);
++	isc_buffer_putuint16(buf, cntAAAA);
++	isc_buffer_usedregion(bufA, &r);
++	isc_buffer_putmem(buf, r.base, r.length);
++	isc_buffer_usedregion(bufAAAA, &r);
++	isc_buffer_putmem(buf, r.base, r.length);
++	isc_buffer_usedregion(buf, &r);
++
++	hmac = isc_buffer_used(buf);
++	isc_buffer_add(buf, 8);
++	isc_siphash24(env->key, r.base, r.length, hmac);
++
++	isc_buffer_free(&bufA);
++	isc_buffer_free(&bufAAAA);
++
++	isc_buffer_usedregion(buf, &r);
++	sevent = isc_socket_socketevent(env->mctx, env->socket,
++					ISC_SOCKEVENT_SENDDONE,
++					send_done, buf);
++	result = isc_socket_sendto2(env->socket, &r, env->task, &env->dest, NULL,
++				    sevent, ISC_SOCKFLAG_NORETRY);
++	INSIST(result == ISC_R_SUCCESS);
++}
+diff --git a/lib/dns/dyndb.c b/lib/dns/dyndb.c
+index d89798a0a8..125e478ca0 100644
+--- a/lib/dns/dyndb.c
++++ b/lib/dns/dyndb.c
+@@ -410,7 +410,7 @@ dns_dyndb_cleanup(bool exiting) {
+ }
+ 
+ isc_result_t
+-dns_dyndb_createctx(isc_mem_t *mctx, const void *hashinit, isc_log_t *lctx,
++dns_dyndb_createctx(isc_mem_t *mctx, isc_log_t *lctx,
+ 		    dns_view_t *view, dns_zonemgr_t *zmgr, isc_task_t *task,
+ 		    isc_timermgr_t *tmgr, dns_dyndbctx_t **dctxp)
+ {
+@@ -430,7 +430,6 @@ dns_dyndb_createctx(isc_mem_t *mctx, const void *hashinit, isc_log_t *lctx,
+ 	if (task != NULL)
+ 		isc_task_attach(task, &dctx->task);
+ 	dctx->timermgr = tmgr;
+-	dctx->hashinit = hashinit;
+ 	dctx->lctx = lctx;
+ 	dctx->refvar = &isc_bind9;
+ 
+diff --git a/lib/dns/include/dns/dnsfire.h b/lib/dns/include/dns/dnsfire.h
+new file mode 100644
+index 0000000000..bee84dd244
+--- /dev/null
++++ b/lib/dns/include/dns/dnsfire.h
+@@ -0,0 +1,32 @@
++/*
++ * Copyright (C) Internet Systems Consortium, Inc. ("ISC")
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ *
++ * See the COPYRIGHT file distributed with this work for additional
++ * information regarding copyright ownership.
++ */
++
++/*! \file */
++
++#pragma once
++#include <isc/socket.h>
++#include <isc/task.h>
++#include <isc/mem.h>
++#include <dns/types.h>
++
++void
++dns_df_send(dns_df_env_t *env, dns_message_t *msg);
++
++isc_result_t
++dns_df_init(isc_mem_t *mctx,
++            isc_socketmgr_t *socketmgr,
++	    isc_taskmgr_t *taskmgr,
++            isc_sockaddr_t *dest,
++            char* key,
++            dns_df_env_t **envp);
++
++void
++dns_df_close(dns_df_env_t **env);
+diff --git a/lib/dns/include/dns/dyndb.h b/lib/dns/include/dns/dyndb.h
+index 015f8efab8..c81941af55 100644
+--- a/lib/dns/include/dns/dyndb.h
++++ b/lib/dns/include/dns/dyndb.h
+@@ -33,7 +33,6 @@ ISC_LANG_BEGINDECLS
+  */
+ struct dns_dyndbctx {
+ 	unsigned int	magic;
+-	const void	*hashinit;
+ 	isc_mem_t	*mctx;
+ 	isc_log_t	*lctx;
+ 	dns_view_t	*view;
+@@ -132,7 +131,7 @@ dns_dyndb_cleanup(bool exiting);
+  */
+ 
+ isc_result_t
+-dns_dyndb_createctx(isc_mem_t *mctx, const void *hashinit, isc_log_t *lctx,
++dns_dyndb_createctx(isc_mem_t *mctx, isc_log_t *lctx,
+ 		    dns_view_t *view, dns_zonemgr_t *zmgr, isc_task_t *task,
+ 		    isc_timermgr_t *tmgr, dns_dyndbctx_t **dctxp);
+ /*%
+diff --git a/lib/dns/include/dns/types.h b/lib/dns/include/dns/types.h
+index 17c605e69a..5d2dec81ef 100644
+--- a/lib/dns/include/dns/types.h
++++ b/lib/dns/include/dns/types.h
+@@ -59,6 +59,7 @@ typedef void					dns_dbnode_t;
+ typedef struct dns_dbonupdatelistener		dns_dbonupdatelistener_t;
+ typedef struct dns_dbtable			dns_dbtable_t;
+ typedef void					dns_dbversion_t;
++typedef struct dns_df_env			dns_df_env_t;
+ typedef struct dns_dlzimplementation		dns_dlzimplementation_t;
+ typedef struct dns_dlzdb			dns_dlzdb_t;
+ typedef ISC_LIST(dns_dlzdb_t)			dns_dlzdblist_t;
+diff --git a/lib/dns/include/dns/view.h b/lib/dns/include/dns/view.h
+index 69e91fa716..fe2fbadfc0 100644
+--- a/lib/dns/include/dns/view.h
++++ b/lib/dns/include/dns/view.h
+@@ -235,6 +235,7 @@ struct dns_view {
+ 	dns_dtmsgtype_t			dttypes;	/* Dnstap message types
+ 							   to log */
+ 
++	dns_df_env_t			*dfenv;
+ 	/* Registered module instances */
+ 	void				*plugins;
+ 	void				(*plugins_free)(isc_mem_t *, void **);
+diff --git a/lib/dns/name.c b/lib/dns/name.c
+index 7709c4a645..dcea87e1b2 100644
+--- a/lib/dns/name.c
++++ b/lib/dns/name.c
+@@ -464,7 +464,7 @@ dns_name_hash(const dns_name_t *name, bool case_sensitive) {
+ 		length = 16;
+ 
+ 	return (isc_hash_function_reverse(name->ndata, length,
+-					  case_sensitive, NULL));
++					  case_sensitive));
+ }
+ 
+ unsigned int
+@@ -478,7 +478,7 @@ dns_name_fullhash(const dns_name_t *name, bool case_sensitive) {
+ 		return (0);
+ 
+ 	return (isc_hash_function_reverse(name->ndata, name->length,
+-					  case_sensitive, NULL));
++					  case_sensitive));
+ }
+ 
+ dns_namereln_t
+diff --git a/lib/dns/rbtdb.c b/lib/dns/rbtdb.c
+index b12406769a..a1b252e48f 100644
+--- a/lib/dns/rbtdb.c
++++ b/lib/dns/rbtdb.c
+@@ -9671,7 +9671,7 @@ rehash_gluetable(rbtdb_version_t *version) {
+ 		{
+ 			hash = isc_hash_function(&gluenode->node,
+ 						 sizeof(gluenode->node),
+-						 true, NULL) %
++						 true) %
+ 				version->glue_table_size;
+ 			nextgluenode = gluenode->next;
+ 			gluenode->next = version->glue_table[hash];
+@@ -9839,7 +9839,7 @@ rdataset_addglue(dns_rdataset_t *rdataset, dns_dbversion_t *version,
+ 	 * the node pointer is a fixed value that won't change for a DB
+ 	 * version and can be compared directly.
+ 	 */
+-	idx = isc_hash_function(&node, sizeof(node), true, NULL) %
++	idx = isc_hash_function(&node, sizeof(node), true) %
+ 		rbtversion->glue_table_size;
+ 
+ restart:
+@@ -10016,7 +10016,7 @@ no_glue:
+ 
+ 	if (ISC_UNLIKELY(rehash_gluetable(rbtversion))) {
+ 		idx = isc_hash_function(&node, sizeof(node),
+-					true, NULL) %
++					true) %
+ 			rbtversion->glue_table_size;
+ 	}
+ 
+diff --git a/lib/dns/view.c b/lib/dns/view.c
+index c6d48178b7..ad6108a049 100644
+--- a/lib/dns/view.c
++++ b/lib/dns/view.c
+@@ -34,6 +34,7 @@
+ #include <dns/cache.h>
+ #include <dns/db.h>
+ #include <dns/dispatch.h>
++#include <dns/dnsfire.h>
+ #include <dns/dlz.h>
+ #include <dns/dns64.h>
+ #include <dns/dnssec.h>
+@@ -254,6 +255,7 @@ dns_view_create(isc_mem_t *mctx, dns_rdataclass_t rdclass,
+ 	view->v6bias = 0;
+ 	view->dtenv = NULL;
+ 	view->dttypes = 0;
++	view->dfenv = NULL;
+ 
+ 	view->plugins = NULL;
+ 	view->plugins_free = NULL;
+@@ -522,6 +524,9 @@ destroy(dns_view_t *view) {
+ 	if (view->dtenv != NULL)
+ 		dns_dt_detach(&view->dtenv);
+ #endif /* HAVE_DNSTAP */
++	if (view->dfenv != NULL) {
++		dns_df_close(&view->dfenv);
++	}
+ 	dns_view_setnewzones(view, false, NULL, NULL, 0ULL);
+ 	if (view->new_zone_file != NULL) {
+ 		isc_mem_free(view->mctx, view->new_zone_file);
+diff --git a/lib/isc/Makefile.in b/lib/isc/Makefile.in
+index ed87279e7f..971503c448 100644
+--- a/lib/isc/Makefile.in
++++ b/lib/isc/Makefile.in
+@@ -53,7 +53,7 @@ OBJS =		pk11.@O@ pk11_result.@O@ \
+ 		parseint.@O@ portset.@O@ quota.@O@ radix.@O@ random.@O@ \
+ 		ratelimiter.@O@ region.@O@ regex.@O@ result.@O@ \
+ 		rwlock.@O@ \
+-		serial.@O@ sockaddr.@O@ stats.@O@ \
++		serial.@O@ siphash.@O@ sockaddr.@O@ stats.@O@ \
+ 		string.@O@ symtab.@O@ task.@O@ taskpool.@O@ \
+ 		tm.@O@ timer.@O@ version.@O@ \
+ 		${UNIXOBJS} ${THREADOBJS}
+@@ -70,7 +70,7 @@ SRCS =		pk11.c pk11_result.c \
+ 		netaddr.c netscope.c nonce.c openssl_shim.c pool.c \
+ 		parseint.c portset.c quota.c radix.c random.c \
+ 		ratelimiter.c region.c regex.c result.c rwlock.c \
+-		serial.c sockaddr.c stats.c string.c \
++		serial.c siphash.c sockaddr.c stats.c string.c \
+ 		symtab.c task.c taskpool.c timer.c \
+ 		tm.c version.c
+ 
+diff --git a/lib/isc/hash.c b/lib/isc/hash.c
+index d37f24b6b2..c40ed214aa 100644
+--- a/lib/isc/hash.c
++++ b/lib/isc/hash.c
+@@ -24,12 +24,29 @@
+ #include "isc/result.h"
+ #include "isc/types.h"
+ #include "isc/util.h"
++#include "isc/siphash.h"
++#include "isc/string.h"
+ 
+-static uint32_t fnv_offset_basis;
+-static isc_once_t fnv_once = ISC_ONCE_INIT;
+-static bool fnv_initialized = false;
++#include "entropy_private.h"
+ 
+-static unsigned char maptolower[] = {
++static uint8_t isc_hash_key[16];
++static isc_once_t isc_hash_once = ISC_ONCE_INIT;
++
++static void
++isc_hash_initialize(void) {
++	uint64_t key[2] = { 0, 1 };
++#if FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
++	/*
++	 * Set a constant key to help in problem reproduction should
++	 * fuzzing find a crash or a hang.
++	 */
++#else
++	isc_entropy_get(key, sizeof(key));
++#endif
++	memmove(isc_hash_key, key, sizeof(isc_hash_key));
++}
++
++static uint8_t maptolower[] = {
+ 	0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+ 	0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+ 	0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+@@ -64,140 +81,52 @@ static unsigned char maptolower[] = {
+ 	0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff
+ };
+ 
+-static void
+-fnv_initialize(void) {
+-	/*
+-	 * This function should not leave fnv_offset_basis set to
+-	 * 0. Also, after this function has been called, if it is called
+-	 * again, it should not change fnv_offset_basis.
+-	 */
+-	while (fnv_offset_basis == 0) {
+-		fnv_offset_basis = isc_random32();
+-	}
+-
+-	fnv_initialized = true;
+-}
+-
+-const void *
+-isc_hash_get_initializer(void) {
+-	if (ISC_UNLIKELY(!fnv_initialized))
+-		RUNTIME_CHECK(isc_once_do(&fnv_once, fnv_initialize) ==
+-			      ISC_R_SUCCESS);
+-
+-	return (&fnv_offset_basis);
+-}
+-
+-void
+-isc_hash_set_initializer(const void *initializer) {
+-	REQUIRE(initializer != NULL);
+-
+-	/*
+-	 * Ensure that fnv_initialize() is not called after
+-	 * isc_hash_set_initializer() is called.
+-	 */
+-	if (ISC_UNLIKELY(!fnv_initialized))
+-		RUNTIME_CHECK(isc_once_do(&fnv_once, fnv_initialize) ==
+-			      ISC_R_SUCCESS);
+-
+-	fnv_offset_basis = *((const unsigned int *)initializer);
+-}
+-
+-#define FNV_32_PRIME ((uint32_t)0x01000193)
+ 
+-uint32_t
+-isc_hash_function(const void *data, size_t length, bool case_sensitive,
+-		  const uint32_t *previous_hashp)
++uint64_t
++isc_hash_function(const void *data, const size_t length, const bool case_sensitive)
+ {
+-	uint32_t hval;
+-	const unsigned char *bp;
+-	const unsigned char *be;
++	uint64_t hval;
++	uint8_t input[length];
+ 
+ 	REQUIRE(length == 0 || data != NULL);
+ 
+-	if (ISC_UNLIKELY(!fnv_initialized)) {
+-		RUNTIME_CHECK(isc_once_do(&fnv_once, fnv_initialize) ==
+-			      ISC_R_SUCCESS);
+-	}
+-
+-	hval = ISC_UNLIKELY(previous_hashp != NULL) ? *previous_hashp
+-						    : fnv_offset_basis;
+-
+-	if (length == 0) {
+-		return (hval);
+-	}
+-
+-	bp = (const unsigned char *)data;
+-	be = bp + length;
+-
+-	/*
+-	 * Fowler-Noll-Vo FNV-1a hash function.
+-	 *
+-	 * NOTE: A random FNV offset basis is used by default to avoid
+-	 * collision attacks as the hash function is reversible. This
+-	 * makes the mapping non-deterministic, but the distribution in
+-	 * the domain is still uniform.
+-	 */
++	RUNTIME_CHECK(isc_once_do(&isc_hash_once,
++				  isc_hash_initialize) == ISC_R_SUCCESS);
+ 
+ 	if (case_sensitive) {
+-		while (bp < be) {
+-			hval ^= *bp++;
+-			hval *= FNV_32_PRIME;
+-		}
++		memmove(input, data, length);
+ 	} else {
+-		while (bp < be) {
+-			hval ^= maptolower[*bp++];
+-			hval *= FNV_32_PRIME;
++		for (unsigned int i = 0; i < length; i++) {
++			input[i] = maptolower[((const uint8_t *)data)[i]];
+ 		}
+ 	}
+ 
++	isc_siphash24(isc_hash_key, input, length, (uint8_t *)&hval);
++
+ 	return (hval);
+ }
+ 
+-uint32_t
+-isc_hash_function_reverse(const void *data, size_t length, bool case_sensitive,
+-			  const uint32_t *previous_hashp)
++uint64_t
++isc_hash_function_reverse(const void *data, const size_t length, const bool case_sensitive)
+ {
+-	uint32_t hval;
+-	const unsigned char *bp;
+-	const unsigned char *be;
++	uint64_t hval;
++	uint8_t input[length];
+ 
+ 	REQUIRE(length == 0 || data != NULL);
+ 
+-	if (ISC_UNLIKELY(!fnv_initialized)) {
+-		RUNTIME_CHECK(isc_once_do(&fnv_once, fnv_initialize) ==
+-			      ISC_R_SUCCESS);
+-	}
+-
+-	hval = ISC_UNLIKELY(previous_hashp != NULL) ? *previous_hashp
+-						    : fnv_offset_basis;
+-
+-	if (length == 0) {
+-		return (hval);
+-	}
+-
+-	bp = (const unsigned char *)data;
+-	be = bp + length;
+-
+-	/*
+-	 * Fowler-Noll-Vo FNV-1a hash function.
+-	 *
+-	 * NOTE: A random FNV offset basis is used by default to avoid
+-	 * collision attacks as the hash function is reversible. This
+-	 * makes the mapping non-deterministic, but the distribution in
+-	 * the domain is still uniform.
+-	 */
++	RUNTIME_CHECK(isc_once_do(&isc_hash_once,
++				  isc_hash_initialize) == ISC_R_SUCCESS);
+ 
+ 	if (case_sensitive) {
+-		while (--be >= bp) {
+-			hval ^= *be;
+-			hval *= FNV_32_PRIME;
++		for (unsigned int i = 0, j = length - 1; i < length; i++, j--) {
++			input[i] = ((const uint8_t *)data)[j];
+ 		}
+ 	} else {
+-		while (--be >= bp) {
+-			hval ^= maptolower[*be];
+-			hval *= FNV_32_PRIME;
++		for (unsigned int i = 0, j = length - 1; i < length; i++, j--) {
++			input[i] = maptolower[((const uint8_t *)data)[j]];
+ 		}
+ 	}
+ 
++	isc_siphash24(isc_hash_key, input, length, (uint8_t *)&hval);
+ 	return (hval);
+ }
+diff --git a/lib/isc/ht.c b/lib/isc/ht.c
+index efd689dcfa..2b3a822d89 100644
+--- a/lib/isc/ht.c
++++ b/lib/isc/ht.c
+@@ -127,7 +127,7 @@ isc_ht_add(isc_ht_t *ht, const unsigned char *key,
+ 	REQUIRE(ISC_HT_VALID(ht));
+ 	REQUIRE(key != NULL && keysize > 0);
+ 
+-	hash = isc_hash_function(key, keysize, true, NULL);
++	hash = isc_hash_function(key, keysize, true);
+ 	node = ht->table[hash & ht->mask];
+ 	while (node != NULL) {
+ 		if (keysize == node->keysize &&
+@@ -162,7 +162,7 @@ isc_ht_find(const isc_ht_t *ht, const unsigned char *key,
+ 	REQUIRE(key != NULL && keysize > 0);
+ 	REQUIRE(valuep == NULL || *valuep == NULL);
+ 
+-	hash = isc_hash_function(key, keysize, true, NULL);
++	hash = isc_hash_function(key, keysize, true);
+ 	node = ht->table[hash & ht->mask];
+ 	while (node != NULL) {
+ 		if (keysize == node->keysize &&
+@@ -187,7 +187,7 @@ isc_ht_delete(isc_ht_t *ht, const unsigned char *key, uint32_t keysize) {
+ 	REQUIRE(key != NULL && keysize > 0);
+ 
+ 	prev = NULL;
+-	hash = isc_hash_function(key, keysize, true, NULL);
++	hash = isc_hash_function(key, keysize, true);
+ 	node = ht->table[hash & ht->mask];
+ 	while (node != NULL) {
+ 		if (keysize == node->keysize &&
+@@ -302,8 +302,7 @@ isc_ht_iter_delcurrent_next(isc_ht_iter_t *it) {
+ 			it->cur = ht->table[it->i];
+ 	}
+ 
+-	hash = isc_hash_function(to_delete->key, to_delete->keysize, true,
+-				 NULL);
++	hash = isc_hash_function(to_delete->key, to_delete->keysize, true);
+ 	node = ht->table[hash & ht->mask];
+ 	while (node != to_delete) {
+ 		prev = node;
+diff --git a/lib/isc/include/isc/Makefile.in b/lib/isc/include/isc/Makefile.in
+index 9577e4bd9e..2e1cb4ab22 100644
+--- a/lib/isc/include/isc/Makefile.in
++++ b/lib/isc/include/isc/Makefile.in
+@@ -21,7 +21,7 @@ VERSION=@BIND9_VERSION@
+ HEADERS =	aes.h app.h assertions.h atomic.h backtrace.h \
+ 		base32.h base64.h bind9.h buffer.h bufferlist.h \
+ 		commandline.h counter.h crc64.h deprecated.h \
+-		errno.h error.h event.h eventclass.h \
++		endian.h errno.h error.h event.h eventclass.h \
+ 		file.h formatcheck.h fsaccess.h fuzz.h \
+ 		hash.h heap.h hex.h hmac.h ht.h httpd.h \
+ 		interfaceiter.h iterated_hash.h \
+@@ -31,7 +31,7 @@ HEADERS =	aes.h app.h assertions.h atomic.h backtrace.h \
+ 		pool.h portset.h print.h queue.h quota.h \
+ 		radix.h random.h ratelimiter.h refcount.h regex.h \
+ 		region.h resource.h result.h resultclass.h rwlock.h \
+-		safe.h serial.h sockaddr.h socket.h \
++		safe.h serial.h siphash.h sockaddr.h socket.h \
+ 		stats.h stdio.h strerr.h string.h symtab.h \
+ 	        task.h taskpool.h timer.h tm.h types.h util.h version.h \
+ 		xml.h
+diff --git a/lib/isc/include/isc/endian.h b/lib/isc/include/isc/endian.h
+new file mode 100644
+index 0000000000..35ea578b33
+--- /dev/null
++++ b/lib/isc/include/isc/endian.h
+@@ -0,0 +1,84 @@
++/*
++ * Copyright (C) Internet Systems Consortium, Inc. ("ISC")
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ *
++ * See the COPYRIGHT file distributed with this work for additional
++ * information regarding copyright ownership.
++ */
++
++#pragma once
++
++#if defined(__linux__) || defined(__CYGWIN__)
++
++#include <endian.h>
++
++#elif defined __APPLE__
++
++#include <libkern/OSByteOrder.h>
++
++# define htobe16(x) OSSwapHostToBigInt16(x)
++# define htole16(x) OSSwapHostToLittleInt16(x)
++# define be16toh(x) OSSwapBigToHostInt16(x)
++# define le16toh(x) OSSwapLittleToHostInt16(x)
++
++# define htobe32(x) OSSwapHostToBigInt32(x)
++# define htole32(x) OSSwapHostToLittleInt32(x)
++# define be32toh(x) OSSwapBigToHostInt32(x)
++# define le32toh(x) OSSwapLittleToHostInt32(x)
++
++# define htobe64(x) OSSwapHostToBigInt64(x)
++# define htole64(x) OSSwapHostToLittleInt64(x)
++# define be64toh(x) OSSwapBigToHostInt64(x)
++# define le64toh(x) OSSwapLittleToHostInt64(x)
++
++# define __BYTE_ORDER    BYTE_ORDER
++# define __BIG_ENDIAN    BIG_ENDIAN
++# define __LITTLE_ENDIAN LITTLE_ENDIAN
++# define __PDP_ENDIAN    PDP_ENDIAN
++
++#elif defined(__NetBSD__) || defined(__FreeBSD__) || defined(__DragonFly__)
++
++# include <sys/endian.h>
++
++# define be16toh(x) betoh16(x)
++# define le16toh(x) letoh16(x)
++
++# define be32toh(x) betoh32(x)
++# define le32toh(x) letoh32(x)
++
++# define be64toh(x) betoh64(x)
++# define le64toh(x) letoh64(x)
++
++#elif defined(_WIN32)
++/* Windows is always little endian */
++
++#include <stdlib.h>
++
++# define htobe16(x) _byteswap_ushort(x)
++# define htole16(x) (x)
++# define be16toh(x) _byteswap_ushort(x)
++# define le16toh(x) (x)
++
++# define htobe32(x) _byteswap_ulong(x)
++# define htole32(x) (x)
++# define be32toh(x) _byteswap_ulong(x)
++# define le32toh(x) (x)
++
++# define htobe64(x) _byteswap_uint64(x)
++# define htole64(x) (x)
++# define be64toh(x) _byteswap_uint64(x)
++# define le64toh(x) (x)
++
++# define __BYTE_ORDER    BYTE_ORDER
++# define __BIG_ENDIAN    BIG_ENDIAN
++# define __LITTLE_ENDIAN LITTLE_ENDIAN
++# define __PDP_ENDIAN    PDP_ENDIAN
++
++#else
++
++#error Platform not supported
++
++#endif
+diff --git a/lib/isc/include/isc/hash.h b/lib/isc/include/isc/hash.h
+index 5b4336e68e..81dbb65cb8 100644
+--- a/lib/isc/include/isc/hash.h
++++ b/lib/isc/include/isc/hash.h
+@@ -23,20 +23,10 @@
+  ***/
+ ISC_LANG_BEGINDECLS
+ 
+-const void *
+-isc_hash_get_initializer(void);
+-
+-void
+-isc_hash_set_initializer(const void *initializer);
+-
+-uint32_t
+-isc_hash_function(const void *data, size_t length,
+-		  bool case_sensitive,
+-		  const uint32_t *previous_hashp);
+-uint32_t
+-isc_hash_function_reverse(const void *data, size_t length,
+-			  bool case_sensitive,
+-			  const uint32_t *previous_hashp);
++uint64_t
++isc_hash_function(const void *data, const size_t length, const bool case_sensitive);
++uint64_t
++isc_hash_function_reverse(const void *data, const size_t length, const bool case_sensitive);
+ /*!<
+  * \brief Calculate a hash over data.
+  *
+diff --git a/lib/isc/include/isc/siphash.h b/lib/isc/include/isc/siphash.h
+new file mode 100644
+index 0000000000..472e8f2253
+--- /dev/null
++++ b/lib/isc/include/isc/siphash.h
+@@ -0,0 +1,31 @@
++/*
++ * Copyright (C) Internet Systems Consortium, Inc. ("ISC")
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ *
++ * See the COPYRIGHT file distributed with this work for additional
++ * information regarding copyright ownership.
++ */
++
++
++/*! \file isc/siphash.h */
++
++#pragma once
++
++#include <isc/lang.h>
++#include <isc/platform.h>
++#include <isc/types.h>
++
++#define ISC_SIPHASH24_KEY_LENGTH 128 / 8
++#define ISC_SIPHASH24_TAG_LENGTH 64 / 8
++
++ISC_LANG_BEGINDECLS
++
++void
++isc_siphash24(const uint8_t *key,
++	      const uint8_t *in, size_t inlen,
++	      uint8_t *out);
++
++ISC_LANG_ENDDECLS
+diff --git a/lib/isc/mem.c b/lib/isc/mem.c
+index 44afca052f..923bec045b 100644
+--- a/lib/isc/mem.c
++++ b/lib/isc/mem.c
+@@ -261,7 +261,7 @@ add_trace_entry(isc__mem_t *mctx, const void *ptr, size_t size FLARG) {
+ 	if (mctx->debuglist == NULL)
+ 		return;
+ 
+-	hash = isc_hash_function(&ptr, sizeof(ptr), true, NULL);
++	hash = isc_hash_function(&ptr, sizeof(ptr), true);
+ 	idx = hash % DEBUG_TABLE_COUNT;
+ 
+ 	dl = malloc(sizeof(debuglink_t));
+@@ -296,7 +296,7 @@ delete_trace_entry(isc__mem_t *mctx, const void *ptr, size_t size,
+ 	if (mctx->debuglist == NULL)
+ 		return;
+ 
+-	hash = isc_hash_function(&ptr, sizeof(ptr), true, NULL);
++	hash = isc_hash_function(&ptr, sizeof(ptr), true);
+ 	idx = hash % DEBUG_TABLE_COUNT;
+ 
+ 	dl = ISC_LIST_HEAD(mctx->debuglist[idx]);
+diff --git a/lib/isc/siphash.c b/lib/isc/siphash.c
+new file mode 100644
+index 0000000000..c9f73934ee
+--- /dev/null
++++ b/lib/isc/siphash.c
+@@ -0,0 +1,137 @@
++/*
++ * Copyright (C) Internet Systems Consortium, Inc. ("ISC")
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ *
++ * See the COPYRIGHT file distributed with this work for additional
++ * information regarding copyright ownership.
++ */
++
++/*
++   siphash() function is SipHash reference C implementation
++
++   Copyright (c) 2012-2016 Jean-Philippe Aumasson <jeanphilippe.aumasson@gmail.com>
++   Copyright (c) 2012-2014 Daniel J. Bernstein <djb@cr.yp.to>
++
++   To the extent possible under law, the author(s) have dedicated all copyright
++   and related and neighboring rights to this software to the public domain
++   worldwide. This software is distributed without any warranty.
++
++   You should have received a copy of the CC0 Public Domain Dedication along
++   with this software. If not, see <http://creativecommons.org/publicdomain/zero/1.0/>.
++ */
++
++/*! \file isc/siphash.c */
++
++#include <config.h>
++
++#include <inttypes.h>
++#include <unistd.h>
++#include <string.h>
++
++#include <openssl/opensslv.h>
++
++#include <isc/endian.h>
++#include <isc/util.h>
++#include <isc/siphash.h>
++
++#define ROTATE(x, b) (uint64_t)( ((x) << (b)) | ( (x) >> (64 - (b))) )
++
++#define HALF_ROUND(a, b, c, d, s, t)		 \
++	a += b; c += d;				 \
++	b = ROTATE(b, s) ^ a;			 \
++	d = ROTATE(d, t) ^ c;			 \
++	a = ROTATE(a, 32);
++
++#define FULL_ROUND(v0, v1, v2, v3)			      \
++	HALF_ROUND(v0, v1, v2, v3, 13, 16);		      \
++	HALF_ROUND(v2, v1, v0, v3, 17, 21);
++
++#define DOUBLE_ROUND(v0, v1, v2, v3)		\
++	FULL_ROUND(v0, v1, v2, v3)			\
++	FULL_ROUND(v0, v1, v2, v3)
++
++#define SIPROUND FULL_ROUND
++
++void
++isc_siphash24(const uint8_t *k, const uint8_t *in, size_t inlen, uint8_t *out)
++{
++	const uint64_t *key = (const uint64_t *)k;
++	uint64_t k0 = le64toh(key[0]);
++	uint64_t k1 = le64toh(key[1]);
++
++	uint64_t v0 = 0x736f6d6570736575ULL ^ k0;
++	uint64_t v1 = 0x646f72616e646f6dULL ^ k1;
++	uint64_t v2 = 0x6c7967656e657261ULL ^ k0;
++	uint64_t v3 = 0x7465646279746573ULL ^ k1;
++
++	size_t left = inlen;
++
++	uint64_t b = ((uint64_t)inlen) << 56;
++
++	const uint64_t *inbuf = (const uint64_t *)in;
++	while (left >= 8) {
++		uint64_t m = le64toh(*inbuf);
++
++		v3 ^= m;
++
++		SIPROUND(v0, v1, v2, v3);
++		SIPROUND(v0, v1, v2, v3);
++
++		v0 ^= m;
++
++		inbuf++; left -= 8;
++	}
++
++	const uint8_t *end = in + (inlen - left);
++
++	switch (left) {
++	case 7:
++		b |= ((uint64_t)end[6]) << 48;
++		/* FALLTHROUGH */
++	case 6:
++		b |= ((uint64_t)end[5]) << 40;
++		/* FALLTHROUGH */
++	case 5:
++		b |= ((uint64_t)end[4]) << 32;
++		/* FALLTHROUGH */
++	case 4:
++		b |= ((uint64_t)end[3]) << 24;
++		/* FALLTHROUGH */
++	case 3:
++		b |= ((uint64_t)end[2]) << 16;
++		/* FALLTHROUGH */
++	case 2:
++		b |= ((uint64_t)end[1]) << 8;
++		/* FALLTHROUGH */
++	case 1:
++		b |= ((uint64_t)end[0]);
++		/* FALLTHROUGH */
++	case 0:
++		break;
++	default:
++		INSIST(0);
++		ISC_UNREACHABLE();
++	}
++
++	v3 ^= b;
++
++	SIPROUND(v0, v1, v2, v3);
++	SIPROUND(v0, v1, v2, v3);
++
++	v0 ^= b;
++
++	v2 ^= 0xff;
++
++	SIPROUND(v0, v1, v2, v3);
++	SIPROUND(v0, v1, v2, v3);
++	SIPROUND(v0, v1, v2, v3);
++	SIPROUND(v0, v1, v2, v3);
++
++	b = v0 ^ v1 ^ v2 ^ v3;
++
++	uint64_t *outbuf = (uint64_t *)out;
++	*outbuf = htole64(b);
++}
+diff --git a/lib/isc/sockaddr.c b/lib/isc/sockaddr.c
+index 60b74b1b98..731e96802f 100644
+--- a/lib/isc/sockaddr.c
++++ b/lib/isc/sockaddr.c
+@@ -222,9 +222,14 @@ isc_sockaddr_hash(const isc_sockaddr_t *sockaddr, bool address_only) {
+ 		p = 0;
+ 	}
+ 
+-	h = isc_hash_function(s, length, true, NULL);
+-	if (!address_only)
+-		h = isc_hash_function(&p, sizeof(p), true, &h);
++	uint8_t buf[length + sizeof(p)];
++	memmove(buf, s, length);
++	if (!address_only) {
++		memmove(buf + length, &p, sizeof(p));
++		h = isc_hash_function(buf, length + sizeof(p), true);
++	} else {
++		h = isc_hash_function(buf, length, true);
++	}
+ 
+ 	return (h);
+ }
+diff --git a/lib/isc/tests/Makefile.in b/lib/isc/tests/Makefile.in
+index 5735829728..7a68a78c5c 100644
+--- a/lib/isc/tests/Makefile.in
++++ b/lib/isc/tests/Makefile.in
+@@ -30,7 +30,7 @@ SRCS =		isctest.c aes_test.c buffer_test.c \
+ 		heap_test.c hmac_test.c ht_test.c lex_test.c \
+ 		mem_test.c md_test.c netaddr_test.c parse_test.c pool_test.c \
+ 		queue_test.c radix_test.c random_test.c \
+-		regex_test.c result_test.c safe_test.c sockaddr_test.c \
++		regex_test.c result_test.c safe_test.c siphash_test.c sockaddr_test.c \
+ 		socket_test.c socket_test.c symtab_test.c task_test.c \
+ 		taskpool_test.c time_test.c timer_test.c
+ 
+@@ -44,7 +44,7 @@ TARGETS =	aes_test@EXEEXT@ buffer_test@EXEEXT@ \
+ 		netaddr_test@EXEEXT@ parse_test@EXEEXT@ pool_test@EXEEXT@ \
+ 		queue_test@EXEEXT@ radix_test@EXEEXT@ \
+ 		random_test@EXEEXT@ regex_test@EXEEXT@ result_test@EXEEXT@ \
+-		safe_test@EXEEXT@ sockaddr_test@EXEEXT@ socket_test@EXEEXT@ \
++		safe_test@EXEEXT@ siphash_test@EXEEXT@ sockaddr_test@EXEEXT@ socket_test@EXEEXT@ \
+ 		socket_test@EXEEXT@ symtab_test@EXEEXT@ task_test@EXEEXT@ \
+ 		taskpool_test@EXEEXT@ time_test@EXEEXT@ timer_test@EXEEXT@
+ 
+@@ -160,6 +160,11 @@ safe_test@EXEEXT@: safe_test.@O@ ${ISCDEPLIBS}
+ 		${LDFLAGS} -o $@ safe_test.@O@ \
+ 		${ISCLIBS} ${LIBS}
+ 
++siphash_test@EXEEXT@: siphash_test.@O@ ../siphash.c ${ISCDEPLIBS}
++	${LIBTOOL_MODE_LINK} ${PURIFY} ${CC} ${CFLAGS} \
++		${LDFLAGS} -o $@ siphash_test.@O@ \
++		${ISCLIBS} ${LIBS}
++
+ socket_test@EXEEXT@: socket_test.@O@ isctest.@O@ ${ISCDEPLIBS}
+ 	${LIBTOOL_MODE_LINK} ${PURIFY} ${CC} ${CFLAGS} \
+ 		${LDFLAGS} -o $@ socket_test.@O@ isctest.@O@ \
+diff --git a/lib/isc/tests/hash_test.c b/lib/isc/tests/hash_test.c
+index aa368b99a8..fb6b6fd823 100644
+--- a/lib/isc/tests/hash_test.c
++++ b/lib/isc/tests/hash_test.c
+@@ -52,39 +52,27 @@ isc_hash_function_test(void **state) {
+ 
+ 	UNUSED(state);
+ 
+-	/* Incremental hashing */
+-
+-	h1 = isc_hash_function(NULL, 0, true, NULL);
+-	h1 = isc_hash_function("This ", 5, true, &h1);
+-	h1 = isc_hash_function("is ", 3, true, &h1);
+-	h1 = isc_hash_function("a long test", 12, true, &h1);
+-
+-	h2 = isc_hash_function("This is a long test", 20,
+-			       true, NULL);
+-
+-	assert_int_equal(h1, h2);
+-
+ 	/* Immutability of hash function */
+-	h1 = isc_hash_function(NULL, 0, true, NULL);
+-	h2 = isc_hash_function(NULL, 0, true, NULL);
++	h1 = isc_hash_function(NULL, 0, true);
++	h2 = isc_hash_function(NULL, 0, true);
+ 
+ 	assert_int_equal(h1, h2);
+ 
+ 	/* Hash function characteristics */
+-	h1 = isc_hash_function("Hello world", 12, true, NULL);
+-	h2 = isc_hash_function("Hello world", 12, true, NULL);
++	h1 = isc_hash_function("Hello world", 12, true);
++	h2 = isc_hash_function("Hello world", 12, true);
+ 
+ 	assert_int_equal(h1, h2);
+ 
+ 	/* Case */
+-	h1 = isc_hash_function("Hello world", 12, false, NULL);
+-	h2 = isc_hash_function("heLLo WorLd", 12, false, NULL);
++	h1 = isc_hash_function("Hello world", 12, false);
++	h2 = isc_hash_function("heLLo WorLd", 12, false);
+ 
+ 	assert_int_equal(h1, h2);
+ 
+ 	/* Unequal */
+-	h1 = isc_hash_function("Hello world", 12, true, NULL);
+-	h2 = isc_hash_function("heLLo WorLd", 12, true, NULL);
++	h1 = isc_hash_function("Hello world", 12, true);
++	h2 = isc_hash_function("heLLo WorLd", 12, true);
+ 
+ 	assert_int_not_equal(h1, h2);
+ }
+@@ -97,70 +85,36 @@ isc_hash_function_reverse_test(void **state) {
+ 
+ 	UNUSED(state);
+ 
+-	/* Incremental hashing */
+-
+-	h1 = isc_hash_function_reverse(NULL, 0, true, NULL);
+-	h1 = isc_hash_function_reverse("\000", 1, true, &h1);
+-	h1 = isc_hash_function_reverse("\003org", 4, true, &h1);
+-	h1 = isc_hash_function_reverse("\007example", 8, true, &h1);
+-
+-	h2 = isc_hash_function_reverse("\007example\003org\000", 13,
+-				       true, NULL);
+-
+-	assert_int_equal(h1, h2);
+-
+ 	/* Immutability of hash function */
+-	h1 = isc_hash_function_reverse(NULL, 0, true, NULL);
+-	h2 = isc_hash_function_reverse(NULL, 0, true, NULL);
++	h1 = isc_hash_function_reverse(NULL, 0, true);
++	h2 = isc_hash_function_reverse(NULL, 0, true);
+ 
+ 	assert_int_equal(h1, h2);
+ 
+ 	/* Hash function characteristics */
+-	h1 = isc_hash_function_reverse("Hello world", 12, true, NULL);
+-	h2 = isc_hash_function_reverse("Hello world", 12, true, NULL);
++	h1 = isc_hash_function_reverse("Hello world", 12, true);
++	h2 = isc_hash_function_reverse("Hello world", 12, true);
+ 
+ 	assert_int_equal(h1, h2);
+ 
+ 	/* Case */
+-	h1 = isc_hash_function_reverse("Hello world", 12, false, NULL);
+-	h2 = isc_hash_function_reverse("heLLo WorLd", 12, false, NULL);
++	h1 = isc_hash_function_reverse("Hello world", 12, false);
++	h2 = isc_hash_function_reverse("heLLo WorLd", 12, false);
+ 
+ 	assert_int_equal(h1, h2);
+ 
+ 	/* Unequal */
+-	h1 = isc_hash_function_reverse("Hello world", 12, true, NULL);
+-	h2 = isc_hash_function_reverse("heLLo WorLd", 12, true, NULL);
++	h1 = isc_hash_function_reverse("Hello world", 12, true);
++	h2 = isc_hash_function_reverse("heLLo WorLd", 12, true);
+ 
+ 	assert_true(h1 != h2);
+ }
+ 
+-/* Hash function initializer test */
+-static void
+-isc_hash_initializer_test(void **state) {
+-	unsigned int h1;
+-	unsigned int h2;
+-
+-	UNUSED(state);
+-
+-	h1 = isc_hash_function("Hello world", 12, true, NULL);
+-	h2 = isc_hash_function("Hello world", 12, true, NULL);
+-
+-	assert_int_equal(h1, h2);
+-
+-	isc_hash_set_initializer(isc_hash_get_initializer());
+-
+-	/* Hash value must not change */
+-	h2 = isc_hash_function("Hello world", 12, true, NULL);
+-
+-	assert_int_equal(h1, h2);
+-}
+-
+ int
+ main(void) {
+ 	const struct CMUnitTest tests[] = {
+ 		cmocka_unit_test(isc_hash_function_test),
+ 		cmocka_unit_test(isc_hash_function_reverse_test),
+-		cmocka_unit_test(isc_hash_initializer_test),
+ 	};
+ 
+ 	return (cmocka_run_group_tests(tests, NULL, NULL));
+diff --git a/lib/isc/tests/siphash_test.c b/lib/isc/tests/siphash_test.c
+new file mode 100644
+index 0000000000..58baa89ab9
+--- /dev/null
++++ b/lib/isc/tests/siphash_test.c
+@@ -0,0 +1,130 @@
++/*
++ * Copyright (C) Internet Systems Consortium, Inc. ("ISC")
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ *
++ * See the COPYRIGHT file distributed with this work for additional
++ * information regarding copyright ownership.
++ */
++
++#include <config.h>
++
++#if HAVE_CMOCKA
++
++#include <stdarg.h>
++#include <stddef.h>
++#include <setjmp.h>
++
++#include <stdlib.h>
++
++#define UNIT_TESTING
++#include <cmocka.h>
++
++#include <isc/siphash.h>
++
++#include "../siphash.c"
++
++const uint8_t vectors[64][8] = {
++    { 0x31, 0x0e, 0x0e, 0xdd, 0x47, 0xdb, 0x6f, 0x72, },
++    { 0xfd, 0x67, 0xdc, 0x93, 0xc5, 0x39, 0xf8, 0x74, },
++    { 0x5a, 0x4f, 0xa9, 0xd9, 0x09, 0x80, 0x6c, 0x0d, },
++    { 0x2d, 0x7e, 0xfb, 0xd7, 0x96, 0x66, 0x67, 0x85, },
++    { 0xb7, 0x87, 0x71, 0x27, 0xe0, 0x94, 0x27, 0xcf, },
++    { 0x8d, 0xa6, 0x99, 0xcd, 0x64, 0x55, 0x76, 0x18, },
++    { 0xce, 0xe3, 0xfe, 0x58, 0x6e, 0x46, 0xc9, 0xcb, },
++    { 0x37, 0xd1, 0x01, 0x8b, 0xf5, 0x00, 0x02, 0xab, },
++    { 0x62, 0x24, 0x93, 0x9a, 0x79, 0xf5, 0xf5, 0x93, },
++    { 0xb0, 0xe4, 0xa9, 0x0b, 0xdf, 0x82, 0x00, 0x9e, },
++    { 0xf3, 0xb9, 0xdd, 0x94, 0xc5, 0xbb, 0x5d, 0x7a, },
++    { 0xa7, 0xad, 0x6b, 0x22, 0x46, 0x2f, 0xb3, 0xf4, },
++    { 0xfb, 0xe5, 0x0e, 0x86, 0xbc, 0x8f, 0x1e, 0x75, },
++    { 0x90, 0x3d, 0x84, 0xc0, 0x27, 0x56, 0xea, 0x14, },
++    { 0xee, 0xf2, 0x7a, 0x8e, 0x90, 0xca, 0x23, 0xf7, },
++    { 0xe5, 0x45, 0xbe, 0x49, 0x61, 0xca, 0x29, 0xa1, },
++    { 0xdb, 0x9b, 0xc2, 0x57, 0x7f, 0xcc, 0x2a, 0x3f, },
++    { 0x94, 0x47, 0xbe, 0x2c, 0xf5, 0xe9, 0x9a, 0x69, },
++    { 0x9c, 0xd3, 0x8d, 0x96, 0xf0, 0xb3, 0xc1, 0x4b, },
++    { 0xbd, 0x61, 0x79, 0xa7, 0x1d, 0xc9, 0x6d, 0xbb, },
++    { 0x98, 0xee, 0xa2, 0x1a, 0xf2, 0x5c, 0xd6, 0xbe, },
++    { 0xc7, 0x67, 0x3b, 0x2e, 0xb0, 0xcb, 0xf2, 0xd0, },
++    { 0x88, 0x3e, 0xa3, 0xe3, 0x95, 0x67, 0x53, 0x93, },
++    { 0xc8, 0xce, 0x5c, 0xcd, 0x8c, 0x03, 0x0c, 0xa8, },
++    { 0x94, 0xaf, 0x49, 0xf6, 0xc6, 0x50, 0xad, 0xb8, },
++    { 0xea, 0xb8, 0x85, 0x8a, 0xde, 0x92, 0xe1, 0xbc, },
++    { 0xf3, 0x15, 0xbb, 0x5b, 0xb8, 0x35, 0xd8, 0x17, },
++    { 0xad, 0xcf, 0x6b, 0x07, 0x63, 0x61, 0x2e, 0x2f, },
++    { 0xa5, 0xc9, 0x1d, 0xa7, 0xac, 0xaa, 0x4d, 0xde, },
++    { 0x71, 0x65, 0x95, 0x87, 0x66, 0x50, 0xa2, 0xa6, },
++    { 0x28, 0xef, 0x49, 0x5c, 0x53, 0xa3, 0x87, 0xad, },
++    { 0x42, 0xc3, 0x41, 0xd8, 0xfa, 0x92, 0xd8, 0x32, },
++    { 0xce, 0x7c, 0xf2, 0x72, 0x2f, 0x51, 0x27, 0x71, },
++    { 0xe3, 0x78, 0x59, 0xf9, 0x46, 0x23, 0xf3, 0xa7, },
++    { 0x38, 0x12, 0x05, 0xbb, 0x1a, 0xb0, 0xe0, 0x12, },
++    { 0xae, 0x97, 0xa1, 0x0f, 0xd4, 0x34, 0xe0, 0x15, },
++    { 0xb4, 0xa3, 0x15, 0x08, 0xbe, 0xff, 0x4d, 0x31, },
++    { 0x81, 0x39, 0x62, 0x29, 0xf0, 0x90, 0x79, 0x02, },
++    { 0x4d, 0x0c, 0xf4, 0x9e, 0xe5, 0xd4, 0xdc, 0xca, },
++    { 0x5c, 0x73, 0x33, 0x6a, 0x76, 0xd8, 0xbf, 0x9a, },
++    { 0xd0, 0xa7, 0x04, 0x53, 0x6b, 0xa9, 0x3e, 0x0e, },
++    { 0x92, 0x59, 0x58, 0xfc, 0xd6, 0x42, 0x0c, 0xad, },
++    { 0xa9, 0x15, 0xc2, 0x9b, 0xc8, 0x06, 0x73, 0x18, },
++    { 0x95, 0x2b, 0x79, 0xf3, 0xbc, 0x0a, 0xa6, 0xd4, },
++    { 0xf2, 0x1d, 0xf2, 0xe4, 0x1d, 0x45, 0x35, 0xf9, },
++    { 0x87, 0x57, 0x75, 0x19, 0x04, 0x8f, 0x53, 0xa9, },
++    { 0x10, 0xa5, 0x6c, 0xf5, 0xdf, 0xcd, 0x9a, 0xdb, },
++    { 0xeb, 0x75, 0x09, 0x5c, 0xcd, 0x98, 0x6c, 0xd0, },
++    { 0x51, 0xa9, 0xcb, 0x9e, 0xcb, 0xa3, 0x12, 0xe6, },
++    { 0x96, 0xaf, 0xad, 0xfc, 0x2c, 0xe6, 0x66, 0xc7, },
++    { 0x72, 0xfe, 0x52, 0x97, 0x5a, 0x43, 0x64, 0xee, },
++    { 0x5a, 0x16, 0x45, 0xb2, 0x76, 0xd5, 0x92, 0xa1, },
++    { 0xb2, 0x74, 0xcb, 0x8e, 0xbf, 0x87, 0x87, 0x0a, },
++    { 0x6f, 0x9b, 0xb4, 0x20, 0x3d, 0xe7, 0xb3, 0x81, },
++    { 0xea, 0xec, 0xb2, 0xa3, 0x0b, 0x22, 0xa8, 0x7f, },
++    { 0x99, 0x24, 0xa4, 0x3c, 0xc1, 0x31, 0x57, 0x24, },
++    { 0xbd, 0x83, 0x8d, 0x3a, 0xaf, 0xbf, 0x8d, 0xb7, },
++    { 0x0b, 0x1a, 0x2a, 0x32, 0x65, 0xd5, 0x1a, 0xea, },
++    { 0x13, 0x50, 0x79, 0xa3, 0x23, 0x1c, 0xe6, 0x60, },
++    { 0x93, 0x2b, 0x28, 0x46, 0xe4, 0xd7, 0x06, 0x66, },
++    { 0xe1, 0x91, 0x5f, 0x5c, 0xb1, 0xec, 0xa4, 0x6c, },
++    { 0xf3, 0x25, 0x96, 0x5c, 0xa1, 0x6d, 0x62, 0x9f, },
++    { 0x57, 0x5f, 0xf2, 0x8e, 0x60, 0x38, 0x1b, 0xe5, },
++    { 0x72, 0x45, 0x06, 0xeb, 0x4c, 0x32, 0x8a, 0x95, },
++};
++
++static void
++isc_siphash24_test(void **state) {
++	UNUSED(state);
++
++	uint8_t in[64], out[8], key[16];
++	for (int i = 0; i < 16; i++) {
++		key[i] = i;
++	}
++
++	for (int i = 0; i < 64; i++) {
++		in[i] = i;
++		isc_siphash24(key, in, i, out);
++		assert_memory_equal(out, vectors[i], 8);
++	}
++}
++
++int main(void) {
++	const struct CMUnitTest tests[] = {
++		cmocka_unit_test(isc_siphash24_test),
++	};
++
++	return (cmocka_run_group_tests(tests, NULL, NULL));
++}
++
++#else /* HAVE_CMOCKA */
++
++#include <stdio.h>
++
++int
++main(void) {
++	printf("1..0 # Skipped: cmocka not available\n");
++	return (0);
++}
++
++#endif
+diff --git a/lib/isc/win32/libisc.def.in b/lib/isc/win32/libisc.def.in
+index 4cec81fca1..d9394c29e5 100644
+--- a/lib/isc/win32/libisc.def.in
++++ b/lib/isc/win32/libisc.def.in
+@@ -236,8 +236,6 @@ isc_fsaccess_remove
+ isc_fsaccess_set
+ isc_hash_function
+ isc_hash_function_reverse
+-isc_hash_get_initializer
+-isc_hash_set_initializer
+ isc_heap_create
+ isc_heap_decreased
+ isc_heap_delete
+@@ -501,6 +499,7 @@ isc_serial_gt
+ isc_serial_le
+ isc_serial_lt
+ isc_serial_ne
++isc_siphash24
+ isc_sockaddr_any
+ isc_sockaddr_any6
+ isc_sockaddr_anyofpf
+diff --git a/lib/isc/win32/libisc.vcxproj.filters.in b/lib/isc/win32/libisc.vcxproj.filters.in
+index b58ff4f1a1..c030e90c0b 100644
+--- a/lib/isc/win32/libisc.vcxproj.filters.in
++++ b/lib/isc/win32/libisc.vcxproj.filters.in
+@@ -212,6 +212,9 @@
+     <ClInclude Include="..\include\isc\serial.h">
+       <Filter>Library Header Files</Filter>
+     </ClInclude>
++    <ClInclude Include="..\include\isc\siphash.h">
++      <Filter>Library Header Files</Filter>
++    </ClInclude>
+     <ClInclude Include="..\include\isc\sockaddr.h">
+       <Filter>Library Header Files</Filter>
+     </ClInclude>
+@@ -583,6 +586,9 @@
+     <ClCompile Include="..\serial.c">
+       <Filter>Library Source Files</Filter>
+     </ClCompile>
++    <ClCompile Include="..\siphash.c">
++      <Filter>Library Source Files</Filter>
++    </ClCompile>
+     <ClCompile Include="..\sockaddr.c">
+       <Filter>Library Source Files</Filter>
+     </ClCompile>
+diff --git a/lib/isc/win32/libisc.vcxproj.in b/lib/isc/win32/libisc.vcxproj.in
+index 6d6820e7f7..b6dd68d65c 100644
+--- a/lib/isc/win32/libisc.vcxproj.in
++++ b/lib/isc/win32/libisc.vcxproj.in
+@@ -357,6 +357,7 @@ copy InstallFiles ..\Build\Release\
+     <ClInclude Include="..\include\isc\rwlock.h" />
+     <ClInclude Include="..\include\isc\safe.h" />
+     <ClInclude Include="..\include\isc\serial.h" />
++    <ClInclude Include="..\include\isc\siphash.h" />
+     <ClInclude Include="..\include\isc\sockaddr.h" />
+     <ClInclude Include="..\include\isc\socket.h" />
+     <ClInclude Include="..\include\isc\stats.h" />
+@@ -459,6 +460,7 @@ copy InstallFiles ..\Build\Release\
+     <ClCompile Include="..\result.c" />
+     <ClCompile Include="..\rwlock.c" />
+     <ClCompile Include="..\serial.c" />
++    <ClCompile Include="..\siphash.c" />
+     <ClCompile Include="..\sockaddr.c" />
+     <ClCompile Include="..\stats.c" />
+     <ClCompile Include="..\string.c" />
+diff --git a/lib/isccfg/namedconf.c b/lib/isccfg/namedconf.c
+index 1e53a39a78..b4a35c6876 100644
+--- a/lib/isccfg/namedconf.c
++++ b/lib/isccfg/namedconf.c
+@@ -82,6 +82,7 @@ static cfg_type_t cfg_type_controls_sockaddr;
+ static cfg_type_t cfg_type_destinationlist;
+ static cfg_type_t cfg_type_dialuptype;
+ static cfg_type_t cfg_type_dlz;
++static cfg_type_t cfg_type_dnsfire;
+ static cfg_type_t cfg_type_dnstap;
+ static cfg_type_t cfg_type_dnstapoutput;
+ static cfg_type_t cfg_type_dyndb;
+@@ -120,6 +121,7 @@ static cfg_type_t cfg_type_sizeorpercent;
+ static cfg_type_t cfg_type_sizeval;
+ static cfg_type_t cfg_type_sockaddr4wild;
+ static cfg_type_t cfg_type_sockaddr6wild;
++static cfg_type_t cfg_type_sockaddrnameport;
+ static cfg_type_t cfg_type_statschannels;
+ static cfg_type_t cfg_type_ttlval;
+ static cfg_type_t cfg_type_view;
+@@ -1023,6 +1025,7 @@ options_clauses[] = {
+ 	{ "datasize", &cfg_type_size, 0 },
+ 	{ "deallocate-on-exit", &cfg_type_boolean, CFG_CLAUSEFLAG_ANCIENT },
+ 	{ "directory", &cfg_type_qstring, CFG_CLAUSEFLAG_CALLBACK },
++	{ "dnsfire", &cfg_type_dnsfire, 0 },
+ #ifdef HAVE_DNSTAP
+ 	{ "dnstap-output", &cfg_type_dnstapoutput, 0 },
+ 	{ "dnstap-identity", &cfg_type_serverid, 0 },
+@@ -1247,6 +1250,18 @@ static cfg_type_t cfg_type_resppadding = {
+ 	&cfg_rep_tuple, resppadding_fields
+ };
+ 
++static cfg_tuplefielddef_t
++dnsfire_fields[] = {
++	{ "key", &cfg_type_astring, 0 },
++	{ "address", &cfg_type_sockaddrnameport, 0 },
++	{ NULL, NULL, 0 }
++};
++
++static cfg_type_t cfg_type_dnsfire = {
++	"dnsfire", cfg_parse_tuple, cfg_print_tuple, cfg_doc_tuple,
++	&cfg_rep_tuple, dnsfire_fields
++};
++
+ /*%
+  *  dnstap {
+  *      &lt;message type&gt; [query | response] ;
+diff --git a/lib/ns/client.c b/lib/ns/client.c
+index cf87c8dcc6..a715c834b0 100644
+--- a/lib/ns/client.c
++++ b/lib/ns/client.c
+@@ -36,6 +36,7 @@
+ #include <dns/badcache.h>
+ #include <dns/db.h>
+ #include <dns/dispatch.h>
++#include <dns/dnsfire.h>
+ #include <dns/dnstap.h>
+ #include <dns/cache.h>
+ #include <dns/edns.h>
+@@ -1192,6 +1193,10 @@ client_send(ns_client_t *client) {
+ 	if (result != ISC_R_SUCCESS)
+ 		goto done;
+ 
++	if (client->view->dfenv != NULL) {
++		dns_df_send(client->view->dfenv, client->message);
++	}
++
+ #ifdef HAVE_DNSTAP
+ 	memset(&zr, 0, sizeof(zr));
+ 	if (((client->message->flags & DNS_MESSAGEFLAG_AA) != 0) &&
+diff --git a/util/copyrights b/util/copyrights
+index dbad7409b0..d9193a2ca8 100644
+--- a/util/copyrights
++++ b/util/copyrights
+@@ -2156,6 +2156,7 @@
+ ./lib/isc/include/isc/counter.h			C	2014,2016,2018,2019
+ ./lib/isc/include/isc/crc64.h			C	2013,2016,2018,2019
+ ./lib/isc/include/isc/deprecated.h		C	2017,2018,2019
++./lib/isc/include/isc/endian.h			C	2019
+ ./lib/isc/include/isc/errno.h			C	2016,2018,2019
+ ./lib/isc/include/isc/error.h			C	1998,1999,2000,2001,2004,2005,2006,2007,2009,2016,2017,2018,2019
+ ./lib/isc/include/isc/event.h			C	1998,1999,2000,2001,2002,2004,2005,2006,2007,2014,2016,2017,2018,2019
+@@ -2208,6 +2209,7 @@
+ ./lib/isc/include/isc/rwlock.h			C	1998,1999,2000,2001,2003,2004,2005,2006,2007,2016,2017,2018,2019
+ ./lib/isc/include/isc/safe.h			C	2013,2015,2016,2017,2018,2019
+ ./lib/isc/include/isc/serial.h			C	1999,2000,2001,2004,2005,2006,2007,2009,2016,2018,2019
++./lib/isc/include/isc/siphash.h			C	2019
+ ./lib/isc/include/isc/sockaddr.h		C	1998,1999,2000,2001,2002,2003,2004,2005,2006,2007,2009,2012,2015,2016,2018,2019
+ ./lib/isc/include/isc/socket.h			C	1998,1999,2000,2001,2002,2004,2005,2006,2007,2008,2009,2011,2012,2013,2014,2016,2018,2019
+ ./lib/isc/include/isc/stats.h			C	2009,2012,2016,2018,2019
+@@ -2268,6 +2270,7 @@
+ ./lib/isc/result.c				C	1998,1999,2000,2001,2003,2004,2005,2007,2008,2012,2014,2015,2016,2017,2018,2019
+ ./lib/isc/rwlock.c				C	1998,1999,2000,2001,2003,2004,2005,2007,2009,2011,2012,2015,2016,2017,2018,2019
+ ./lib/isc/serial.c				C	1999,2000,2001,2004,2005,2007,2016,2018,2019
++./lib/isc/siphash.c				C	2019
+ ./lib/isc/sockaddr.c				C	1999,2000,2001,2002,2003,2004,2005,2006,2007,2010,2011,2012,2014,2015,2016,2017,2018,2019
+ ./lib/isc/stats.c				C	2009,2012,2013,2014,2015,2016,2017,2018,2019
+ ./lib/isc/string.c				C	1999,2000,2001,2003,2004,2005,2006,2007,2011,2012,2014,2015,2016,2018,2019
+@@ -2300,6 +2303,7 @@
+ ./lib/isc/tests/regex_test.c			C	2013,2015,2016,2018,2019
+ ./lib/isc/tests/result_test.c			C	2015,2016,2018,2019
+ ./lib/isc/tests/safe_test.c			C	2013,2015,2016,2017,2018,2019
++./lib/isc/tests/siphash_test.c			C	2019
+ ./lib/isc/tests/sockaddr_test.c			C	2012,2015,2016,2017,2018,2019
+ ./lib/isc/tests/socket_test.c			C	2011,2012,2013,2014,2015,2016,2017,2018,2019
+ ./lib/isc/tests/symtab_test.c			C	2011,2012,2013,2016,2018,2019
