@@ -5,13 +5,13 @@
 
 ### What is a DNS Firewall
 DNS Firewall is a solution that prevents users and systems from connecting
-to mailicious services by filtering DNS queries - and not returning the IP
+to malicious services by filtering DNS queries - and not returning the IP
 addresses of known mailicious services to user.
 
 ### The problem
 Filtering DNS queries is easy - DNS runs on port 53, it's unencrypted, the
 traffic to outside (unfiltered) resolvers can easily be blocked. The same
-works with DNS over TLS - it's using a well-known port 953, which can easily
+works with DNS over TLS - it's using a well-known port 853, which can easily
 be firewalled.
 
 The problem arises with DNS over HTTPS - from a regular firewall standpoint

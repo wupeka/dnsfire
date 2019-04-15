@@ -90,7 +90,7 @@ main(int argc, char **argv) {
 
 
 
-	while ((c = getopt(argc, argv, "4:6:b:p:k:e:c:h:")) != -1) {
+	while ((c = getopt(argc, argv, "4:6:k:b:p:e:c:h:")) != -1) {
 		switch (c) {
 		case '4':
 			table4 = strdup(optarg);

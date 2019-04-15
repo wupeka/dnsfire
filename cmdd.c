@@ -109,7 +109,7 @@ main(int argc, char **argv) {
 
 
 
-	while ((c = getopt(argc, argv, "4:5:6:7:b:p:e:c:h:")) != -1) {
+	while ((c = getopt(argc, argv, "4:5:6:7:k:b:p:e:c:h:")) != -1) {
 		switch (c) {
 		case '4':
 			add4 = strdup(optarg);
