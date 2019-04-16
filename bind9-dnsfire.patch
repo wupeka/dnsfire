@@ -1546,7 +1546,7 @@ index cf87c8dcc6..a715c834b0 100644
  	if (result != ISC_R_SUCCESS)
  		goto done;
  
-+	if (client->view->dfenv != NULL) {
++	if (client->view != NULL && client->view->dfenv != NULL) {
 +		dns_df_send(client->view->dfenv, client->message);
 +	}
 +
